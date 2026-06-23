@@ -1,0 +1,115 @@
+---
+# RISEFX custom build: builds the Zulip image from our application
+# fork (RISEFX/zulip) and pushes it to our GHCR namespace.
+#
+# This is intentionally separate from upstream's dockerfile-build.yaml
+# (which is fenced to github.repository_owner == 'zulip') so that
+# pulling updates from zulip/docker-zulip does not conflict with our
+# pipeline.
+name: Build and push RISEFX Zulip image
+
+on:
+  # Release builds: push a bare-numeric tag <zulip-version>-<rev>,
+  # e.g. 12.0-1, to this repository. The image is tagged identically,
+  # and the same tag name is used as the ref to build from RISEFX/zulip.
+  push:
+    tags:
+      - "[0-9]*.[0-9]*-[0-9]*"
+  # Manual builds: choose any ref of RISEFX/zulip and any image tag,
+  # e.g. to build the branch tip into a `:dev` image for testing.
+  workflow_dispatch:
+    inputs:
+      zulip_git_ref:
+        description: "Ref (tag/branch/SHA) in RISEFX/zulip to build"
+        required: true
+        default: risefx-main-12-0
+      image_tag:
+        description: "Docker image tag to push"
+        required: true
+        default: dev
+
+permissions: {}
+
+env:
+  PACKAGE_NAME: ghcr.io/risefx/zulip-server
+  ZULIP_GIT_URL: https://github.com/RISEFX/zulip.git
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create GitHub releases on tag pushes
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      # On a tag push we build that tag from RISEFX/zulip and tag the
+      # image identically. On a manual run we use the provided inputs.
+      - name: Resolve build parameters
+        id: params
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.zulip_git_ref }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            echo "zulip_ref=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "image_tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "zulip_ref=$INPUT_REF" >> "$GITHUB_OUTPUT"
+            echo "image_tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ env.PACKAGE_NAME }}:${{ steps.params.outputs.image_tag }}
+          build-args: |
+            ZULIP_GIT_URL=${{ env.ZULIP_GIT_URL }}
+            ZULIP_GIT_REF=${{ steps.params.outputs.zulip_ref }}
+          cache-from: type=registry,ref=${{ env.PACKAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.PACKAGE_NAME }}:buildcache,mode=max
+
+      # Record each released image on the repo's Releases tab. Only on
+      # tag pushes (manual dev builds don't create releases).
+      - name: Create or update GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Use a hand-written CHANGELOG.md section if one exists for
+          # this tag; otherwise fall back to a generated note so a
+          # missing changelog entry never fails the build.
+          if grep -q "^## \[$TAG\]" CHANGELOG.md; then
+            .github/scripts/extract-changelog.py
+          else
+            printf 'Automated build of `%s` from `RISEFX/zulip@%s`.\n' \
+              "ghcr.io/risefx/zulip-server:$TAG" "$TAG" > release-notes.md
+          fi
+          title="Zulip Server $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$title" --notes-file release-notes.md
+          else
+            gh release create "$TAG" --title "$title" \
+              --notes-file release-notes.md --verify-tag
+          fi
