@@ -1,5 +1,0 @@
----
-services:
-  zulip:
-    environment:
-      MANUAL_CONFIGURATION: True

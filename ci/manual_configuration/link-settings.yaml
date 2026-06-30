@@ -1,5 +1,0 @@
----
-services:
-  zulip:
-    environment:
-      LINK_SETTINGS_TO_DATA: True

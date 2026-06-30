@@ -1,8 +1,0 @@
----
-services:
-  zulip:
-    deploy:
-      resources:
-        limits:
-          # This is enough to force single-process
-          memory: 3000m
