@@ -1,8 +1,0 @@
----
-services:
-  zulip:
-    deploy:
-      resources:
-        limits:
-          # This is enough to trip into multi-process queue workers
-          memory: 4000m
