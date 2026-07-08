@@ -1,0 +1,161 @@
+---
+# RISEFX custom build: builds the Zulip image from our application
+# fork (RISEFX/zulip), packaged with an UNMODIFIED upstream
+# zulip/docker-zulip recipe, and pushes it to our GHCR namespace.
+#
+# We never copy or maintain the upstream build process. Each release is
+# keyed entirely by the tag you push, which encodes three pins:
+#
+#   <Z>-<R>-risefx<P>            e.g.  12.1-0-risefx1
+#     Z = Zulip version            (12.1)
+#     R = upstream recipe revision (0)  -> zulip/docker-zulip tag <Z>-<R>
+#     P = RISEFX patch revision    (1)  -> RISEFX/zulip tag <Z>-risefx<P>
+#
+# From that single tag the build derives the following, with no "latest"
+# or branch lookups, so every build is reproducible:
+#
+#     recipe   <- zulip/docker-zulip @ <Z>-<R>       (12.1-0)
+#     app src  <- RISEFX/zulip       @ <Z>-risefx<P> (12.1-risefx1)
+#     image    -> ghcr.io/risefx/zulip-server:<Z>-<R>-risefx<P>
+#
+# The recipe is fetched at build time straight into buildx as a git
+# context, so this repo stays minimal: there is no Dockerfile or build
+# context to carry or merge here.
+#
+# This is intentionally separate from upstream's dockerfile-build.yaml
+# (fenced to github.repository_owner == 'zulip') so that pulling updates
+# from zulip/docker-zulip never conflicts with our pipeline.
+name: Build and push RISEFX Zulip image
+
+on:
+  # Release builds only. Push a tag <Z>-<R>-risefx<P> (e.g. 12.1-0-risefx1)
+  # to this repository; the matching RISEFX/zulip tag <Z>-risefx<P> must
+  # already exist. The strict format is re-checked in the build below, so
+  # this glob only has to be a superset.
+  push:
+    tags:
+      - "[0-9]*.[0-9]*-[0-9]*-risefx[0-9]*"
+
+permissions: {}
+
+env:
+  PACKAGE_NAME: ghcr.io/risefx/zulip-server
+  ZULIP_GIT_URL: https://github.com/RISEFX/zulip.git
+  UPSTREAM_DOCKER_ZULIP_URL: https://github.com/zulip/docker-zulip.git
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create GitHub releases on tag pushes
+      packages: write # push the image to GHCR
+    steps:
+      # Parse the pushed tag into its three pins and validate that both
+      # referenced upstream tags actually exist before building. No repo
+      # checkout is needed: the recipe is a remote git context and the
+      # release notes are generated inline.
+      - name: Resolve and validate build parameters
+        id: params
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # Expected: <major>.<minor>-<recipe-rev>-risefx<patch-rev>
+          if [[ ! "$TAG" =~ ^([0-9]+\.[0-9]+)-([0-9]+)-risefx([0-9]+)$ ]]; then
+            echo "::error::Tag '$TAG' must look like <Z>-<R>-risefx<P>, e.g. 12.1-0-risefx1."
+            exit 1
+          fi
+          Z="${BASH_REMATCH[1]}"
+          R="${BASH_REMATCH[2]}"
+          P="${BASH_REMATCH[3]}"
+          RECIPE_TAG="$Z-$R"        # zulip/docker-zulip recipe
+          APP_TAG="$Z-risefx$P"     # RISEFX/zulip application source
+
+          echo "Zulip version : $Z"
+          echo "Recipe tag    : $RECIPE_TAG  ($UPSTREAM_DOCKER_ZULIP_URL)"
+          echo "App tag       : $APP_TAG  ($ZULIP_GIT_URL)"
+
+          # Guard: the upstream recipe tag must exist.
+          if ! git ls-remote --exit-code --tags \
+              "$UPSTREAM_DOCKER_ZULIP_URL" "refs/tags/$RECIPE_TAG" >/dev/null; then
+            echo "::error::Recipe tag '$RECIPE_TAG' not found in zulip/docker-zulip."
+            exit 1
+          fi
+
+          # Guard: our application tag must exist; capture its commit for
+          # provenance labels and release notes.
+          APP_SHA="$(git ls-remote --tags "$ZULIP_GIT_URL" "refs/tags/$APP_TAG" | cut -f1)"
+          if [ -z "$APP_SHA" ]; then
+            echo "::error::Application tag '$APP_TAG' not found in RISEFX/zulip. Rebase and tag your patches first."
+            exit 1
+          fi
+          echo "App commit    : $APP_SHA"
+
+          # Guard: the recipe must actually target Zulip <Z>. Tolerant if
+          # upstream's default ref is not a plain version, or if the file
+          # can't be fetched (the build below would fail loudly anyway).
+          recipe_default="$(curl -fsSL \
+            "https://raw.githubusercontent.com/zulip/docker-zulip/$RECIPE_TAG/Dockerfile" \
+            | sed -n 's/^ARG ZULIP_GIT_REF=//p' | head -1 || true)"
+          recipe_mm="$(printf '%s' "$recipe_default" | grep -oE '^[0-9]+\.[0-9]+' || true)"
+          if [ -n "$recipe_mm" ] && [ "$recipe_mm" != "$Z" ]; then
+            echo "::error::Recipe $RECIPE_TAG targets Zulip $recipe_mm, but tag implies $Z."
+            exit 1
+          fi
+
+          {
+            echo "recipe_tag=$RECIPE_TAG"
+            echo "app_tag=$APP_TAG"
+            echo "app_sha=$APP_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the unmodified upstream recipe (fetched as a remote git
+      # context pinned to the immutable <Z>-<R> tag) against our
+      # application fork, so the build is reproducible.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: "${{ env.UPSTREAM_DOCKER_ZULIP_URL }}#refs/tags/${{ steps.params.outputs.recipe_tag }}"
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ env.PACKAGE_NAME }}:${{ github.ref_name }}
+          build-args: |
+            ZULIP_GIT_URL=${{ env.ZULIP_GIT_URL }}
+            ZULIP_GIT_REF=${{ steps.params.outputs.app_tag }}
+          labels: |
+            org.opencontainers.image.title=Zulip Server (RISEFX)
+            org.opencontainers.image.version=${{ steps.params.outputs.app_tag }}
+            org.opencontainers.image.revision=${{ steps.params.outputs.app_sha }}
+            org.opencontainers.image.source=${{ env.ZULIP_GIT_URL }}
+            fx.rise.zulip.recipe=zulip/docker-zulip@${{ steps.params.outputs.recipe_tag }}
+          cache-from: type=registry,ref=${{ env.PACKAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.PACKAGE_NAME }}:buildcache,mode=max
+
+      # Record each released image on the repo's Releases tab. Notes are
+      # auto-generated by GitHub; build provenance lives in the image's
+      # OCI labels above, so there is nothing to hand-write here.
+      - name: Create or update GitHub release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          title="Zulip Server $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$title"
+          else
+            gh release create "$TAG" --title "$title" --generate-notes --verify-tag
+          fi
