@@ -1,0 +1,62 @@
+---
+# Watches zulip/zulip for new stable releases and opens a tracking
+# issue when one appears, prompting a manual rebase of our patches
+# (RISEFX/zulip @ risefx-main-12-0) onto the new upstream version.
+#
+# We deliberately do NOT auto-rebase: our patches sit on top of
+# upstream, so adopting a new version can hit merge conflicts that a
+# human must resolve before building a production image.
+name: Watch upstream Zulip releases
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Find newest upstream stable tag
+        id: upstream
+        run: |
+          latest=$(git ls-remote --tags --refs \
+              https://github.com/zulip/zulip.git \
+            | awk '{print $2}' \
+            | sed 's#refs/tags/##' \
+            | grep -E '^[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -1)
+          echo "Newest upstream stable tag: $latest"
+          echo "tag=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Open tracking issue if new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          title="Upstream Zulip release: $TAG"
+          if gh issue list --search "in:title $title" --state all \
+              --json title --jq '.[].title' | grep -qxF "$title"; then
+            echo "Tracking issue for $TAG already exists; nothing to do."
+            exit 0
+          fi
+          body="zulip/zulip published a new stable release: ${TAG}.
+
+          To adopt it in our image:
+
+          1. In RISEFX/zulip, rebase risefx-main-12-0 onto ${TAG}
+             (resolve any conflicts), then tag it, e.g. ${TAG}-1.
+          2. Push the matching tag ${TAG}-1 to RISEFX/docker-zulip.
+             The build workflow then produces
+             ghcr.io/risefx/zulip-server:${TAG}-1 automatically.
+          3. Bump the image tag in compose.yaml / your deployment.
+
+          Auto-rebasing is intentionally not done: our patches may
+          conflict with upstream and need human review."
+          gh issue create --title "$title" --body "$body"
